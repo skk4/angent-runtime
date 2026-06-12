@@ -15,7 +15,7 @@ llm = ChatOpenAI(
     temperature=0,
 )
 
-higher = 150
+higher = 200
 lower = 100
 # 这里定义了几个函数，分别用于获取股票价格、财务数据、社区情绪以及进行分析。这些函数会被节点调用来更新状态中的相应字段。
 def fetch_price(state: InvestState) -> dict:

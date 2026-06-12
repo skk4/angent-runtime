@@ -3,7 +3,7 @@ from src.graph import build_graph
 from langgraph.checkpoint.postgres import PostgresSaver
 
 # config = {"configurable": {"thread_id": "invest_006"}}
-config = {"configurable": {"thread_id": "invest_pg_011"}}
+config = {"configurable": {"thread_id": "invest_pg_013"}}
 inputs = {"messages": [{"role": "user", "content": "分析泡泡玛特"}],
         "thread_id": config["configurable"]["thread_id"]}
 
