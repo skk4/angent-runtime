@@ -14,10 +14,28 @@ async def run_agent(question: str) -> str:
     
     # TODO：后面替换成真实的 LangGraph 调用
     # 现在先模拟耗时操作
-    await asyncio.sleep(2)
+
+    import httpx
+    # 模拟调用外部 API 获取数据
+    async with httpx.AsyncClient(timeout=360, trust_env=False) as client:
+        try:
+            r = await client.post(
+                "http://localhost:8100/analyze",
+                json={"question": question}
+            )
+            print(f"状态码：{r.status_code}")
+            print(f"响应内容：'{r.text}'")
+            print(f"响应headers：{dict(r.headers)}")
+            return r.json()["analysis"]
+        except Exception as e:
+            activity.logger.error(f"HTTP 请求异常：{type(e).__name__}: {e}")
+            raise
+        # return r.json()["analysis"]
+    
+    # await asyncio.sleep(2)
     
     # 模拟返回分析结果
-    return f"泡泡玛特投研分析（DEMO）：当前股价 168.5 HKD，收入同比 +184.7%，净利润同比 +316.3%，问题：{question}"
+    # return f"泡泡玛特投研分析（DEMO）：当前股价 168.5 HKD，收入同比 +184.7%，净利润同比 +316.3%，问题：{question}"
 
 
 # ============================================================

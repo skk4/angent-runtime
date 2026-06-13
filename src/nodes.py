@@ -84,8 +84,9 @@ def analyze(state: InvestState) -> dict:
     1. 给出简洁的投研分析，100字以内
     2. 如果数据明显异常（价格为0或负数、价格高于{higher}或者低于{lower}、财务数据缺失），必须只输出：DATA_INVALID
     3. 不要编造任何数字，只基于上面提供的数据分析"""
-    
+    print(f"完整prompt：{prompt}")
     response = llm.invoke(prompt)
+    print(f"LLM 原始输出：{response.content}")  # 加这行
     return {"analysis": response.content,
             "retry_count": retry_count + 1}
 

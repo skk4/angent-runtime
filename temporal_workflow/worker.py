@@ -21,6 +21,7 @@ async def main():
 
 
     # 启动 Worker，开始处理任务
+    # 等待 Workflow 执行时，Worker 会自动调用注册的 Activity 函数
     await worker.run()
 
 if __name__ == "__main__":

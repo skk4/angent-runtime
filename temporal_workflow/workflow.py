@@ -56,7 +56,7 @@ class InvestWorkflow:
         result = await workflow.execute_activity(
             deliver_report,
             args=[analysis, approval],
-            schedule_to_close_timeout=timedelta(seconds=30),
+            schedule_to_close_timeout=timedelta(seconds=300),
         )
 
         return result
