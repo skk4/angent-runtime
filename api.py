@@ -1,4 +1,8 @@
 from fastapi import FastAPI
+from fastapi import HTTPException
+from fastapi import Request
+from temporalio.client import Client
+from temporal_workflow.workflow import InvestWorkflow
 from pydantic import BaseModel
 from langgraph.checkpoint.postgres import PostgresSaver
 from src.graph import build_graph
@@ -8,9 +12,8 @@ import time
 
 load_dotenv()
 
+TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
 DB_URL = os.getenv("POSTGRES_DB_URL", "postgresql://ceap:ceap_dev@localhost:5432/langgraph_db")
-
-# DB_URL = "postgresql://ceap:ceap_dev@localhost:5432/langgraph_db"
 app = FastAPI()
 
 class AnalysisRequest(BaseModel):
@@ -39,7 +42,6 @@ def analyze(req: AnalysisRequest, response_model=AnalysisResponse):
     注意：这里每次都是新 thread_id，不做断点续跑
     如果需要断点续跑，由调用方（Temporal Activity）传入固定 thread_id
     """
-    # DB_URL = "postgresql://ceap:ceap_dev@localhost:5432/langgraph_db"
 
     # 每次请求生成唯一 thread_id，避免 checkpoint 复用导致返回旧结果
     thread_id = f"api-{int(time.time())}"
@@ -65,14 +67,55 @@ def analyze(req: AnalysisRequest, response_model=AnalysisResponse):
         # 返回分析结果和 thread_id（调用方可用 thread_id 查询历史或继续运行）
         return AnalysisResponse(analysis=result["analysis"], thread_id=thread_id)
 
+# 审核回调接口
+@app.post("/api/review/callback")
+async def review_callback(request: Request):
+    """
+    Lark 回调接口（统一处理两种情况）
 
-@app.get("/health")
-def health():
-    """健康检查接口，供监控系统或 Docker healthcheck 使用"""
-    return {"status": "ok"}
+    情况1：地址验证
+        Lark 发 POST + {"type": "url_verification", "challenge": "xxx"}
+        原样返回 challenge，完成验证
 
+    情况2：卡片按钮点击
+        Lark 发 POST + action 信息
+        解析 workflow_id 和 decision，发 Temporal Signal 唤醒 Workflow
+    """
+    body = await request.json()
+    print(f"Lark 回调 body：{body}")
 
+    # 情况1：地址验证——原样返回 challenge
+    if body.get("type") == "url_verification":
+        return {"challenge": body.get("challenge")}
+
+    # 情况2：卡片按钮点击——解析 action 发 Signal
+    try:
+        # 从 action value 里取 workflow_id 和 decision
+        # 按钮定义里 value = {"workflow_id": "xxx", "decision": "approve"}
+        action = body.get("event", {}).get("action", {})  # 注意加 event 层
+        value = action.get("value", {})
+        workflow_id = value.get("workflow_id")
+        decision = value.get("decision")
+
+        if not workflow_id or not decision:
+            print(f"⚠️ 缺少必要参数：workflow_id={workflow_id}, decision={decision}")
+            return {"status": "ok"}
+
+        if decision not in ("approve", "reject"):
+            raise HTTPException(status_code=400, detail=f"无效的审核决定：{decision}")
+
+        # 连接 Temporal Server，发 Signal
+        client = await Client.connect(TEMPORAL_ADDRESS)
+        handle = client.get_workflow_handle(workflow_id)
+        await handle.signal(InvestWorkflow.review_signal, decision)
+
+        print(f"✅ Signal 已发送：workflow_id={workflow_id}, decision={decision}")
+        return {"status": "ok"}
+
+    except Exception as e:
+        print(f"❌ Signal 发送失败：{e}")
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=  "0.0.0.0", port=8100)
+    uvicorn.run(app, host="0.0.0.0", port=8100)

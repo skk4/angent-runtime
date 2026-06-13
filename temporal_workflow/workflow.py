@@ -1,5 +1,6 @@
 from temporalio import workflow
 from datetime import timedelta
+from typing import Optional
 
 # workflow.unsafe.imports_passed_through() 是一个上下文管理器
 # Temporal 的 Workflow 代码在沙箱环境里运行（为了保证确定性重放）
@@ -13,6 +14,45 @@ with workflow.unsafe.imports_passed_through():
 # @workflow.defn 告诉 Temporal：这个 class 是一个 Workflow 定义
 # Temporal 会用它生成 Workflow 类型名（默认用类名 InvestWorkflow）
 class InvestWorkflow:
+
+    """
+    投研 Agent Workflow
+
+    流程：
+        1. run_agent：调 LangGraph Runtime 跑投研分析（行情/财报/舆情 → LLM）
+        2. 等待人工审核 Signal（最多 24 小时，进程可以死，状态持久化在 Temporal DB）
+        3. deliver_report：审核通过发报告，拒绝则终止
+
+    Signal 机制：
+        审核人调 send_signal.py 发 Signal → Workflow 从暂停点唤醒 → 继续执行
+        这是 Dify 做不到的能力：天级别的等待，进程重启状态不丢
+    """
+
+    def __init__(self):
+        # Workflow 内部可以定义成员变量，保持状态
+        # 这些变量的值会随着 Workflow 执行不断变化
+        # Temporal 会自动把它们持久化到数据库，保证进程崩了重启后状态不丢
+        # 审核决定：None = 还在等待，"approve" = 通过，"reject" = 拒绝
+        # 初始化为 None，等 Signal 到了再赋值
+        self._review_decision: Optional[str] = None
+
+    @workflow.signal
+    def review_signal(self, decision: str):
+        """
+        定义 Signal 处理函数，接收审核结果。
+        审核人调 send_signal.py 发 Signal，参数是 "approve" 或 "reject"。
+        Temporal 收到 Signal 后会自动调用这个函数，传入 decision 参数。
+        函数里把审核结果保存到成员变量里，Workflow 主流程从暂停点唤醒继续执行。
+        """
+        workflow.logger.info(f"收到审核 Signal：{decision}")
+
+        # 校验 decision 值，防止非法输入
+        if decision not in ("approve", "reject"):
+            workflow.logger.error(f"无效的审核决策：{decision}, 忽略")
+            return
+        
+        self._review_decision = decision   
+
 
     @workflow.run
     # @workflow.run 标记这是 Workflow 的入口函数
@@ -36,27 +76,48 @@ class InvestWorkflow:
         analysis = await workflow.execute_activity(
             run_agent,
             question,
-            schedule_to_close_timeout=timedelta(seconds=30),
+            schedule_to_close_timeout=timedelta(seconds=300),
         )
 
-        # Step 2：等人工审核
-        # start_to_close_timeout：从开始执行到完成的超时
-        # 1 小时内必须审核完，否则超时失败
-        # 后面改成 Temporal Signal，可以等天级别
+        #Step 2：发审核通知（告诉审核人有报告需要审核）
+        # human_review 现在只负责发通知，不等结果
+        # 结果通过 Signal 异步传回（Step 3）
         approval = await workflow.execute_activity(
             human_review,
             analysis,
-            start_to_close_timeout=timedelta(hours=1),
+            start_to_close_timeout=timedelta(seconds=60),
         )
 
-        # Step 3：交付报告（精确一次）
-        # deliver_report 有两个参数，用 args=[] 列表传入
-        # Temporal 保证：就算进程在这里崩了重启，deliver_report 不会重复执行
-        # 这正是 LangGraph Checkpointer 做不到的——它只保证状态恢复，不保证副作用精确一次
+
+        # --------------------------------------------------------
+        # Step 3：等待人工审核 Signal（最多 24 小时）
+        #
+        # wait_condition 的工作原理：
+        # - Workflow 挂起，不消耗任何 CPU/内存
+        # - 进程可以完全退出，状态持久化在 Temporal DB
+        # - Signal 到了（review_signal 被调用）→ _review_decision 有值 → 条件满足 → 唤醒
+        # - 超时（24小时没收到 Signal）→ asyncio.TimeoutError
+        #
+        # 这正是 LangGraph Checkpointer 做不到的：
+        # Checkpointer 只保证状态恢复，不保证进程可以长期挂起等外部事件
+        try:
+            await workflow.wait_condition(lambda: self._review_decision is not None, timeout=timedelta(hours=24))
+            workflow.logger.info(f"收到审核结果：{self._review_decision}")
+        except workflow.TimeoutError:
+            workflow.logger.error("等待审核超时，终止 Workflow")
+            return "reject"
+
+        # --------------------------------------------------------
+        # Step 4：根据审核结果交付报告
+        # deliver_report 被 @activity.defn 装饰，Temporal 保证精确一次执行
+        # 就算进程在这里崩了重启，deliver_report 不会重复发送
         result = await workflow.execute_activity(
             deliver_report,
-            args=[analysis, approval],
+            #deliver_report 需要两个参数，是 "approve" 或 "reject"
+            args=[analysis, self._review_decision],
             schedule_to_close_timeout=timedelta(seconds=300),
         )
+
+        workflow.logger.info(f"Workflow 完成，结果：{result}")
 
         return result
