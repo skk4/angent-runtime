@@ -68,7 +68,7 @@ class InvestWorkflow:
     @workflow.run
     # @workflow.run 标记这是 Workflow 的入口函数
     # 每个 @workflow.defn 的 class 必须有且只有一个 @workflow.run 方法
-    async def run(self, question: str) -> str:
+    async def run(self, question: str, routing_mode: str = "auto") -> str:
         """
         投研 Workflow 主流程：
         1. 调 LangGraph Runtime 跑 Agent 分析
@@ -90,7 +90,7 @@ class InvestWorkflow:
         try:
             analysis = await workflow.execute_activity(
                 run_agent,
-                question,
+                args=[question, routing_mode], # args 列表（问题 + 路由模式一起传）
                 schedule_to_close_timeout=timedelta(seconds=300),
                 retry_policy=RetryPolicy(
                         initial_interval=timedelta(seconds=2),

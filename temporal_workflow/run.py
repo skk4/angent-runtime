@@ -24,6 +24,12 @@ client_id = sys.argv[2] if len(sys.argv) > 2 else "default"
 symbol = sys.argv[3] if len(sys.argv) > 3 else "09992HK"
 
 
+# ---- 读命令行参数那段，在 symbol 后面加 ----
+# 路由模式：auto(分流) / fixed(强制固定线) / react(强制ReAct)
+# 定时日报传 fixed 保证确定性；交互/默认 auto 走分流
+routing_mode = sys.argv[4] if len(sys.argv) > 4 else "auto"  # 第 4 个命令行参数
+
+
 async def main():
 
     # 三层问题分类（Redis缓存 → 规则引擎 → LLM兜底）
@@ -56,7 +62,7 @@ async def main():
     try:
         workflow_run = await client.start_workflow(
             InvestWorkflow.run, # Workflow 入口函数
-            question, # 传给 run(self, question) 的参数
+            args=[question, routing_mode], # 传给 run(self, question) 的参数 args 列表（问题 + 路由模式
             id=workflow_id,  # Workflow 实例 ID，必须全局唯一
             task_queue="invest-task-queue",  # Worker 监听的 Task Queue 必须和 worker.py 一致
             # ALLOW_DUPLICATE_FAILED_ONLY：

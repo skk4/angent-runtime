@@ -117,24 +117,33 @@ async def _update_lark_card(message_id: str, content: str):
 # ============================================================
 # Activity 1：调 LangGraph Runtime 跑投研分析
 # ============================================================
-@activity.defn
-async def run_agent(question: str) -> str:
+@activity.defn                                                          # Temporal 装饰器：标记这是一个 Activity（可被持久化、重试）
+async def run_agent(question: str, routing_mode: str = "auto") -> str:  # 入参：问题 + 路由模式；默认 auto（向后兼容，旧调用不传也能跑）
     """
-    调用你的 LangGraph Runtime，返回分析结果。
+    调用 LangGraph Runtime，返回分析结果。
+    routing_mode 显式决定走哪条线（调用方声明，不靠内容猜）。
     """
-    activity.logger.info(f"run_agent 开始，问题：{question}")
-    #trust_env=False：绕过 Shadowrocket 代理，确保本地直连
-    async with httpx.AsyncClient(timeout=360, trust_env=False) as client:
-        try:
-            r = await client.post(
-                "http://localhost:8100/analyze",
-                json={"question": question}
-            )
-            return r.json()["analysis"]
-        except Exception as e:
-            activity.logger.error(f"HTTP 请求异常：{type(e).__name__}: {e}")
-            raise
+    endpoint = {                                       # 路由模式 → endpoint 映射表
+        "auto": "/invest",                             # auto：交给 Supervisor 自动分流（交互场景）
+        "fixed": "/analyze",                           # fixed：强制固定线（定时日报，要确定性可复现）
+        "react": "/analyze_react",                     # react：强制 ReAct 线
+    }.get(routing_mode, "/invest")                     # 按模式取 endpoint；未知模式兜底走 /invest
 
+    activity.logger.info(f"run_agent 开始（mode={routing_mode} → {endpoint}）：{question}")  # 记录模式+endpoint，Temporal 日志可审计
+    # trust_env=False：绕过 Shadowrocket 代理，确保本地直连
+    async with httpx.AsyncClient(timeout=360, trust_env=False) as client:  # 异步 HTTP 客户端；with 自动关连接
+        try:                                           # 包裹请求，任何失败都抛出让 Temporal 按策略重试
+            r = await client.post(                     # 发 POST 请求
+                f"http://localhost:8100{endpoint}",    # 拼完整 URL（8100 是 api.py 端口）
+                json={"question": question}            # 请求体：用户问题
+            )
+            r.raise_for_status()                       # 非 2xx 直接抛 HTTPStatusError（明确触发重试，不靠 KeyError 间接抛）
+            result = r.json()                          # 解析响应 JSON（{analysis, thread_id}）
+            activity.logger.info(f"run_agent 完成，thread_id={result.get('thread_id')}")  # thread_id 前缀能看出实际走了哪条线
+            return result["analysis"]                  # 返回分析文字给 Workflow
+        except Exception as e:                         # 捕获所有异常（网络/超时/非2xx/解析失败）
+            activity.logger.error(f"HTTP 请求异常：{type(e).__name__}: {e}")  # 记录异常类型和详情
+            raise                                      # 重新抛出，让 Temporal 按 RetryPolicy 重试（最多 3 次）
 
 # ============================================================
 # Activity 2：发审核通知（Lark 交互卡片）
