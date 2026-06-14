@@ -96,6 +96,8 @@ async def review_callback(request: Request):
         value = action.get("value", {})
         workflow_id = value.get("workflow_id")
         decision = value.get("decision")
+        #提取 message_id
+        message_id = body.get("event", {}).get("context", {}).get("open_message_id", "")
 
         if not workflow_id or not decision:
             print(f"⚠️ 缺少必要参数：workflow_id={workflow_id}, decision={decision}")
@@ -107,14 +109,39 @@ async def review_callback(request: Request):
         # 连接 Temporal Server，发 Signal
         client = await Client.connect(TEMPORAL_ADDRESS)
         handle = client.get_workflow_handle(workflow_id)
-        await handle.signal(InvestWorkflow.review_signal, decision)
+        await handle.signal(InvestWorkflow.review_signal, {"decision": decision, "message_id": message_id})
 
         print(f"✅ Signal 已发送：workflow_id={workflow_id}, decision={decision}")
-        return {"status": "ok"}
-
+        # 根据审核结果返回不同的卡片更新
+        return {
+            "toast": {
+                "type": "success" if decision == "approve" else "error", 
+                "content": f"审核{'已通过' if decision == 'approve' else '已拒绝'}",
+            },
+            "card": {
+                "type": "raw",
+                "data": {
+                    "schema": "2.0",
+                    "body": {
+                        "elements": [
+                            {
+                                "tag": "markdown",
+                                "content": f"**审核结果：{'✅ 已通过' if decision == 'approve' else '❌ 已拒绝'}**\n\nWorkflow ID：`{workflow_id}`\n\n报告{'正在发送到群组...' if decision == 'approve' else '已终止'}"
+                            }
+                        ]
+                    }
+                }
+            }
+        }
     except Exception as e:
         print(f"❌ Signal 发送失败：{e}")
         return {"status": "error", "message": str(e)}
+
+@app.get("/health")
+def health():
+    """健康检查接口"""
+    return {"status": "ok"}
+
 
 if __name__ == "__main__":
     import uvicorn

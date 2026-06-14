@@ -23,6 +23,7 @@ import os
 from dotenv import load_dotenv
 from temporalio.client import Client
 from temporal_workflow.workflow import InvestWorkflow
+from datetime import timedelta
 
 load_dotenv()
 
@@ -70,14 +71,17 @@ async def main():
     # --------------------------------------------------------
     try:
         # 连接 Temporal Server
-        client = await Client.connect(TEMPORAL_ADDRESS)
+        client = await Client.connect(TEMPORAL_ADDRESS, rpc_timeout=timedelta(seconds=10))
 
         # 获取已有 Workflow 的 handle（不新建 Workflow，只是获取引用）
         handle = client.get_workflow_handle(workflow_id)
 
         # 发 Signal——唤醒正在 wait_condition 等待的 Workflow
         # review_signal 是 workflow.py 里 @workflow.signal 装饰的方法
-        await handle.signal(InvestWorkflow.review_signal, decision)
+        await handle.signal(InvestWorkflow.review_signal, {
+        "decision": decision,
+        "message_id": ""  # 手动发 Signal 没有 message_id
+        })
 
         print(f"✅ Signal 发送成功")
         print(f"   Workflow [{workflow_id}] 已收到审核结果：{decision}")

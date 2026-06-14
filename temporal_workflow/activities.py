@@ -29,6 +29,91 @@ def _build_lark_sign(secret: str) -> tuple[str, str]:
     sign = base64.b64encode(hmac_code).decode("utf-8")
     return timestamp, sign
 
+
+async def _get_lark_token() -> str:
+    """
+    换取 Lark tenant_access_token
+    有效期 2 小时，失败抛明确异常让调用方处理
+    生产环境应缓存复用，避免频繁换取（TODO）
+    """
+    async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+        resp = await client.post(
+            "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
+            json={
+                "app_id": os.getenv("LARK_APP_ID"),
+                "app_secret": os.getenv("LARK_APP_SECRET"),
+            }
+        )
+        data = resp.json()
+        # 明确校验，失败抛异常让 Temporal 重试
+        if "tenant_access_token" not in data:
+            raise Exception(f"换取 Lark token 失败：{data}")
+        return data["tenant_access_token"]
+
+async def _send_webhook_message(content: str):
+    """
+    用 webhook 发文本消息到 invest-alert 群
+    用于：报告发送 + 卡片更新失败时的降级通知
+    """
+    timestamp, sign = _build_lark_sign(os.getenv("LARK_SECRET", ""))
+    payload = {
+        "timestamp": timestamp,
+        "sign": sign,
+        "msg_type": "text",
+        "content": {"text": content}
+    }
+    async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+        r = await client.post(os.getenv("LARK_WEBHOOK_URL"), json=payload)
+        return r
+
+
+async def _update_lark_card(message_id: str, content: str):
+    """
+    更新 Lark 卡片内容（PATCH 原消息）
+    辅助功能——失败不影响主流程，降级发 webhook 消息
+    """
+    if not message_id:
+        return
+    
+    try:
+        # 换取 tenant_access_token
+        token = await _get_lark_token()
+        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+  
+            # PATCH 更新原卡片
+            r = await client.patch(
+                f"https://open.larksuite.com/open-apis/im/v1/messages/{message_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "msg_type": "interactive",
+                    "content": json.dumps({
+                        "elements": [{
+                            "tag": "div",
+                            "text": {
+                                "content": content,
+                                "tag": "lark_md"
+                            }
+                        }]
+                    })
+                }
+            )
+            activity.logger.info(f"卡片更新结果：{r.status_code}, {r.text}")
+
+            # 非 2xx 降级发新消息
+            if r.status_code not in (200, 201):
+                activity.logger.warning(f"卡片更新返回非 2xx：{r.status_code}，降级发新消息")
+                await _send_webhook_message(f"📋 审核状态更新：{content}")
+
+    except Exception as e:
+        # 卡片更新失败只记录，降级发新消息
+        activity.logger.warning(f"卡片更新失败（非致命），降级发新消息：{e}")
+        try:
+            await _send_webhook_message(f"📋 审核状态更新：{content}")
+        except Exception as e2:
+            # 降级也失败，只记录，绝不影响主流程
+            activity.logger.error(f"降级消息也失败：{e2}")
+
+
 # ============================================================
 # Activity 1：调 LangGraph Runtime 跑投研分析
 # ============================================================
@@ -68,17 +153,8 @@ async def human_review(analysis: str) -> str:
     # Step 1：用 App ID + App Secret 换取 tenant_access_token
     # token 有效期 2 小时，生产环境应缓存复用
     # --------------------------------------------------------
-    async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
-        token_resp = await client.post(
-            "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal",
-            json={
-                "app_id": os.getenv("LARK_APP_ID"),
-                "app_secret": os.getenv("LARK_APP_SECRET"),
-            }
-        )
-        token = token_resp.json()["tenant_access_token"]
-        activity.logger.info("tenant_access_token 获取成功")
 
+    token = await _get_lark_token()
     # --------------------------------------------------------
     # Step 2：构建卡片消息（按钮用 value，触发回调）
     # --------------------------------------------------------
@@ -153,17 +229,20 @@ async def human_review(analysis: str) -> str:
 # ============================================================
 
 @activity.defn
-async def deliver_report(analysis: str, approval: str) -> str:
+async def deliver_report(analysis: str, approval: str, message_id: str = "") -> str:
     """
     审核通过 → 发报告到 invest-alert 群（webhook + 签名）
     审核拒绝 → 终止，不发送
+    完成后更新原审核卡片状态（如果有 message_id）
     被 @activity.defn 装饰后，Temporal 保证精确一次执行——
     就算进程崩了重启，这个函数不会被重复调用
     """
-    activity.logger.info(f"deliver_report 开始，审核结果：{approval}")
+    activity.logger.info(f"deliver_report 开始，审核结果：{approval}, message_id：{message_id}")
 
     if approval != "approve":
         print("❌ 报告审核未通过，已终止")
+        if message_id:
+            await _update_lark_card(message_id, "❌ 审核未通过，报告已终止")
         return "rejected"
 
     # 生成 webhook 签名
@@ -186,13 +265,73 @@ async def deliver_report(analysis: str, approval: str) -> str:
                 json=payload
             )
             activity.logger.info(f"报告发送结果：{r.status_code}, {r.text}")
+
+            if r.status_code not in (200, 201):
+                raise Exception(f"webhook 返回非 2xx：{r.status_code}, {r.text}")
             print(f"📊 投研报告已发送到 invest-alert 群")
+
     except Exception as e:
         activity.logger.error(f"报告发送失败：{e}")
+        if message_id:
+            await _update_lark_card(message_id, f"❌ 报告发送失败：{str(e)[:100]}")
         raise
+    
 
+    # 报告发送成功后，单独更新卡片（辅助功能）
+    now = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+    await _update_lark_card(
+        message_id,
+        f"✅ 审核通过，报告已发送到 invest-alert 群\n\n发送时间：{now}"
+    )
     return "delivered"
 
 
+# ============================================================
+# Activity 4：Workflow 失败告警（兜底）
+# ============================================================
+@activity.defn
+async def send_failure_alert(workflow_id: str, error: str) -> str:
+    """
+    Workflow 最终失败时发告警给审核员
+    让审核员知道流程失败，需要人工处理
+    这是兜底 Activity，本身也可能失败——失败只记录，不再重试
+    """
+    activity.logger.error(f"Workflow 失败告警：{workflow_id}, 原因：{error}")
 
+    try:
+        # 换取 token
+        token = await _get_lark_token()
+
+        # 发消息给审核员
+        now = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+        message = (
+            f"🚨 投研 Workflow 失败告警\n\n"
+            f"**Workflow ID**：`{workflow_id}`\n\n"
+            f"**失败时间**：{now}\n\n"
+            f"**失败原因**：{error[:200]}\n\n"
+            f"**处理建议**：\n"
+            f"1. 查看 Temporal UI：http://localhost:8080\n"
+            f"2. 确认报告是否已发送\n"
+            f"3. 如需重发 Signal：\n"
+            f"   `python -m temporal_workflow.send_signal {workflow_id} approve`"
+        )
+
+        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+            r = await client.post(
+                "https://open.larksuite.com/open-apis/im/v1/messages?receive_id_type=open_id",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "receive_id": os.getenv("LARK_REVIEWER_OPEN_ID"),
+                    "msg_type": "text",
+                    "content": json.dumps({"text": message})
+                }
+            )
+            activity.logger.info(f"失败告警发送结果：{r.status_code}")
+            print(f"🚨 失败告警已发送给审核员")
+
+    except Exception as e:
+        # 告警本身失败，只记录，不再抛异常
+        activity.logger.error(f"失败告警发送失败：{e}")
+
+    return "alerted"
 
