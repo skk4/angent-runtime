@@ -22,4 +22,6 @@ class InvestState(TypedDict):
     thread_id: str      # 线程 ID（checkpoint 用）
     bull_view: str       # 多头研究员论据    —— 新增
     bear_view: str       # 空头研究员论据    —— 新增
+    debate_history: str    # 多空辩论的累积记录（每轮追加）  —— 新增
+    debate_round: int      # 已进行的辩论轮数（控制循环）    —— 新增
 
